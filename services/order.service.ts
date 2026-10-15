@@ -9,6 +9,7 @@ import {
 import { getCurrentDbUserId } from '@/lib/current-db-user'
 import { getCurrentUser } from '@/lib/auth'
 import { getS3ObjectPreviewUrl } from '@/lib/s3'
+import type { InvoiceData } from '@/components/order/OrderInvoice'
 
 const allowedOrderStatuses = ['pending', 'paid', 'shipped', 'delivered', 'cancelled']
 
@@ -113,8 +114,6 @@ export async function getDashboardOrderDetails(orderId: string) {
   }
 
   const subtotal = getSubtotal(row.items)
-  const shipping = 0
-  const gst = Math.max(0, row.order.totalAmount - subtotal - shipping)
 
   return {
     order: {
@@ -139,9 +138,13 @@ export async function getDashboardOrderDetails(orderId: string) {
           : 'Failed',
       providerPaymentId: row.payment?.providerPaymentId ?? null,
     },
+    customer: {
+      email: row.customer?.email ?? null,
+    },
     address: {
-      name: row.order.shippingPhone,
+      name: row.address?.name || row.customer?.name || 'Customer',
       phone: row.order.shippingPhone,
+      secondPhone: row.order.shippingPhone2,
       line: [
         row.order.addressLine1,
         row.order.addressLine2,
@@ -161,6 +164,40 @@ export async function getDashboardOrderDetails(orderId: string) {
       price: formatCurrency(item.productPrice),
       total: formatCurrency(item.productPrice * item.quantity),
       image: item.productImage ? getS3ObjectPreviewUrl(item.productImage) : '/home/new-arrival-model.png',
+    })),
+  }
+}
+
+export async function getOrderConfirmationInvoiceDetails(orderId: string): Promise<InvoiceData | null> {
+  const details = await getDashboardOrderDetails(orderId)
+
+  if (!details) {
+    return null
+  }
+
+  return {
+    orderId: details.order.orderNumber || details.order.id,
+    orderDate: details.order.date,
+    status: details.order.status,
+    customerName: details.address.name,
+    customerEmail: details.customer.email,
+    customerPhone: details.address.phone,
+    customerPhone2: details.address.secondPhone,
+    shippingAddress: details.address.line,
+    paymentMethod:
+      details.payment.method?.toUpperCase() ?? details.payment.provider.toUpperCase(),
+    paymentStatus: details.payment.status,
+    subtotal: details.summary[0]?.value ?? details.order.total,
+    deliveryCharge:
+      details.summary.find((item) => item.label === 'Delivery Charge')?.value ?? 'Free',
+    total: details.order.total,
+    items: details.items.map((item) => ({
+      id: item.id,
+      product: item.product,
+      variant: item.variant,
+      quantity: item.quantity,
+      unitPrice: item.price,
+      total: item.total,
     })),
   }
 }

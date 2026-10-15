@@ -1,6 +1,7 @@
 import { count, desc, eq, inArray, or } from 'drizzle-orm'
 
 import { orderItems, orders, payments } from '@/db/schema/orders'
+import { addresses, users } from '@/db/schema/users'
 import { db } from '@/lib/db'
 
 type OrderRecord = {
@@ -63,15 +64,23 @@ export async function countDashboardOrders(userId: string) {
 }
 
 export async function findDashboardOrderDetailRow(userId: string, orderId: string) {
-  const [order] = await db
-    .select()
+  const [row] = await db
+    .select({
+      order: orders,
+      customer: { name: users.name, email: users.email },
+      address: { name: addresses.fullName },
+    })
     .from(orders)
+    .leftJoin(users, eq(orders.userId, users.id))
+    .leftJoin(addresses, eq(orders.addressId, addresses.id))
     .where(or(eq(orders.id, orderId), eq(orders.orderNumber, orderId)))
     .limit(1)
 
-  if (!order || order.userId !== userId) {
+  if (!row || row.order.userId !== userId) {
     return null
   }
+
+  const { order, customer, address } = row
 
   const items = await db
     .select()
@@ -86,6 +95,8 @@ export async function findDashboardOrderDetailRow(userId: string, orderId: strin
 
   return {
     order,
+    customer,
+    address,
     items,
     payment: payment ?? null,
   }
