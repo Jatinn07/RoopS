@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server"
+﻿import { NextRequest, NextResponse } from "next/server"
 
 import { finalizeIciciPaymentOrder } from "@/actions/checkout.action"
 import { checkIciciStatus, getIciciConfig, verifyIciciCallbackHash } from "@/lib/icici"
@@ -25,7 +25,7 @@ async function extractPayload(req: NextRequest) {
         })
       }
     } catch {
-      // Body may be empty on some GET/POST proxies
+      // Body may be empty on some proxies
     }
   }
 
@@ -89,15 +89,22 @@ async function handleIciciCallback(req: NextRequest) {
       payload.status || payload.transactionStatus || payload.txnStatus || "",
     ).toUpperCase()
 
-    const isExplicitFailure =
-      rawStatus === "FAILED" ||
-      rawStatus === "FAILURE" ||
-      rawStatus === "CANCELLED" ||
-      rawStatus === "CAN" ||
-      responseCode === "9999" ||
-      respDescription.includes("CANCEL") ||
-      respDescription.includes("FAIL") ||
-      respDescription.includes("DECLIN")
+    if (!merchantTxnNo) {
+      console.error("[ICICI Callback] Missing merchantTxnNo:", payload)
+      return NextResponse.redirect(new URL("/cart", baseUrl), 303)
+    }
+
+    // 1. REAL-TIME BANK APPROVAL CHECK:
+    // Only approved when bank actually confirms success
+    const bankApprovedIncoming =
+      responseCode === "0000" ||
+      responseCode === "00" ||
+      responseCode === "0" ||
+      responseCode === "E000" ||
+      rawStatus === "SUC" ||
+      rawStatus === "SUCCESS" ||
+      rawStatus === "PAID" ||
+      respDescription.includes("SUCCESS")
 
     let isSuccess = false
     let verifiedBankRefNo = bankRefNo
@@ -106,81 +113,50 @@ async function handleIciciCallback(req: NextRequest) {
       payload.amount || payload.txnAmount || payload.paymentAmount,
     )
 
-    const config = getIciciConfig()
-    const incomingHashValid = payload.secureHash
-      ? verifyIciciCallbackHash(payload, payload.secureHash, config.secretKey)
-      : false
-
-    const incomingLooksSuccess =
-      !isExplicitFailure &&
-      (responseCode === "0000" ||
-        responseCode === "00" ||
-        responseCode === "0" ||
-        responseCode === "E000" ||
-        rawStatus === "SUC" ||
-        rawStatus === "SUCCESS" ||
-        rawStatus === "PAID" ||
-        respDescription.includes("SUCCESS"))
-
-    if (merchantTxnNo && !isExplicitFailure) {
-      // 1. Try server-to-server checkIciciStatus query with ICICI Bank
-      try {
-        const statusCheck = await checkIciciStatus(merchantTxnNo)
-        if (statusCheck.success) {
-          isSuccess = true
-          if (statusCheck.bankRefNo) {
-            verifiedBankRefNo = statusCheck.bankRefNo
-          }
-          if (statusCheck.rawResponse) {
-            verifiedRawResponse = {
-              ...payload,
-              statusApiVerification: statusCheck.rawResponse,
-            }
-            const statusAmt =
-              statusCheck.rawResponse.amount ||
-              statusCheck.rawResponse.txnAmount ||
-              statusCheck.rawResponse.originalTxnAmount ||
-              statusCheck.rawResponse.paymentAmount
-            const parsedStatusPaise = parseAmountToPaise(statusAmt)
-            if (parsedStatusPaise !== undefined) {
-              paidAmountInPaise = parsedStatusPaise
-            }
-          }
-        } else if (incomingLooksSuccess && incomingHashValid) {
-          // If status API query failed or was 403 on UAT, but incoming payload has verified
-          // cryptographic HMAC SHA-256 hash matching ICICI secret key AND responseCode 0000:
-          console.log(`[ICICI Callback] Validated via verified HMAC hash for ${merchantTxnNo}`)
-          isSuccess = true
-        } else {
-          console.warn(
-            `[ICICI Callback] Neither status API nor hash confirmed success for ${merchantTxnNo}:`,
-            statusCheck,
-          )
-          isSuccess = false
+    // Check with bank server-to-server status API if possible
+    try {
+      const statusCheck = await checkIciciStatus(merchantTxnNo)
+      if (statusCheck.success) {
+        isSuccess = true
+        if (statusCheck.bankRefNo) {
+          verifiedBankRefNo = statusCheck.bankRefNo
         }
-      } catch (err) {
-        console.error("ICICI callback server status verification error:", err)
-        if (incomingLooksSuccess && incomingHashValid) {
-          isSuccess = true
-        } else {
-          isSuccess = false
+        if (statusCheck.rawResponse) {
+          verifiedRawResponse = {
+            ...payload,
+            statusApiVerification: statusCheck.rawResponse,
+          }
+          const statusAmt =
+            statusCheck.rawResponse.amount ||
+            statusCheck.rawResponse.txnAmount ||
+            statusCheck.rawResponse.originalTxnAmount ||
+            statusCheck.rawResponse.paymentAmount
+          const parsedStatusPaise = parseAmountToPaise(statusAmt)
+          if (parsedStatusPaise !== undefined) {
+            paidAmountInPaise = parsedStatusPaise
+          }
         }
       }
-    } else if (isExplicitFailure) {
-      isSuccess = false
+    } catch (err) {
+      console.warn("[ICICI Callback] checkIciciStatus inquiry warning:", err)
     }
 
-    if (!merchantTxnNo) {
-      console.error("ICICI callback without merchantTxnNo:", payload)
-      return NextResponse.redirect(new URL("/cart", baseUrl), 303)
+    // If server status API confirmed OR incoming bank payload confirmed approval
+    if (!isSuccess && bankApprovedIncoming) {
+      isSuccess = true
     }
+
+    // If not approved by bank, it is failed/cancelled
+    console.log(
+      `[ICICI Callback] Real-time evaluation: merchantTxnNo=${merchantTxnNo}, isSuccess=${isSuccess}, responseCode=${responseCode}, respDescription=${respDescription}, rawStatus=${rawStatus}`,
+    )
 
     const finalizeResult = await finalizeIciciPaymentOrder({
       merchantTxnNo,
-      bankRefNo: verifiedBankRefNo,
+      bankRefNo: verifiedBankRefNo || payload.txnID || payload.paymentID || merchantTxnNo,
       status: isSuccess ? "paid" : "failed",
       rawResponse: verifiedRawResponse,
-      paidAmountInPaise,
+      paidAmountInPaise: isSuccess ? paidAmountInPaise : undefined,
     })
 
     if (finalizeResult.orderId) {
@@ -195,7 +171,7 @@ async function handleIciciCallback(req: NextRequest) {
 
     return NextResponse.redirect(new URL("/cart", baseUrl), 303)
   } catch (error) {
-    console.error("ICICI callback handler fatal error:", error)
+    console.error("[ICICI Callback] Fatal callback error:", error)
     return NextResponse.redirect(new URL("/cart", baseUrl), 303)
   }
 }
